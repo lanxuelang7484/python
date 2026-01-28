@@ -1,0 +1,23 @@
+from pygrok import Grok
+
+# 批量日志样本
+log_samples = [
+    "2026-01-25 14:30:00.123 [http-nio-8081-exec-1] [f8e7d6c5b4a392817069584736251409] INFO  com.example.controller.ServiceAController - ServiceA 接收到请求，trace-id=f8e7d6c5b4a392817069584736251409，请求参数：test123",
+    "2026-01-25 14:30:00.456 [http-nio-8082-exec-1] [f8e7d6c5b4a392817069584736251409] INFO  com.example.controller.ServiceBController - ServiceB 接收到ServiceA的请求，trace-id=f8e7d6c5b4a392817069584736251409，请求参数：test123",
+    "2026-01-25 14:30:00.789 [http-nio-8083-exec-1] [f8e7d6c5b4a392817069584736251409] ERROR com.example.controller.ServiceCController - ServiceC 处理失败，trace-id=f8e7d6c5b4a392817069584736251409，异常信息：空指针"
+]
+
+# grok表达式
+grok_pattern = r"%{TIMESTAMP_ISO8601:log_date}\s*\[%{NOTSPACE:thread_id}\]\s*\[%{NOTSPACE:trace_id}\]\s*%{LOGLEVEL:log_level}\s*%{NOTSPACE:logger_name}\s*-%{GREEDYDATA:log_message}"
+grok = Grok(grok_pattern)
+
+# 批量检测
+for i, log in enumerate(log_samples):
+    print(f"\n=== 测试日志样本 {i+1} ===")
+    match = grok.match(log)
+    if match:
+        print("匹配成功：")
+        for k, v in match.items():
+            print(f"  {k}: {v}")
+    else:
+        print("匹配失败！")
