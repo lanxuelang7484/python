@@ -1,0 +1,333 @@
+
+grok {
+  match => [ 
+    "message", 
+    # 规则1：匹配带trace-id的日志（优先匹配）
+    "%{TIMESTAMP_ISO8601:log.date}\\s*\\[%{NOTSPACE:thread-id}\\]\\s*\\[%{NOTSPACE:trace-id}\\]\\s*%{LOGLEVEL:log.level}\\s*%{NOTSPACE:logger_name}\\s*-%{GREEDYDATA:log_message}",
+    # 规则2：匹配不带trace-id的日志（兼容原有逻辑）
+    "%{TIMESTAMP_ISO8601:log.date}\\s*\\[%{NOTSPACE:thread-id}\\]\\s*%{LOGLEVEL:log.level}\\s*"
+  ]
+  tag_on_failure => []
+}
+
+
+path.config: "/etc/logstash/conf.d/*.conf"
+
+# 1. 接收Beats数据的主pipeline（核心修改：新增trace-id解析+分索引逻辑）
+pipeline.id: beats-server
+queue.type: persisted
+config.string: |
+input { beats { port => 5044 }}
+filter {
+  # 第一步：修正grok表达式，兼容「带trace-id」和「不带trace-id」的日志
+  grok {
+    match => [ 
+      "message", 
+      # 匹配带trace-id的日志（优先级更高）
+      "%{TIMESTAMP_ISO8601:log.date}\\s*\\[%{NOTSPACE:thread-id}\\]\\s*\\[%{NOTSPACE:trace-id}\\]\\s*%{LOGLEVEL:log.level}\\s*%{NOTSPACE:logger_name}\\s*-%{GREEDYDATA:log_message}",
+      # 匹配不带trace-id的原始日志（兼容原有格式）
+      "%{TIMESTAMP_ISO8601:log.date}\\s*\\[%{NOTSPACE:thread-id}\\]\\s*%{LOGLEVEL:log.level}\\s*"
+    ]
+    # 匹配失败不打tag（避免干扰原有逻辑）
+    tag_on_failure => []
+  }
+
+  # 第二步：保留原有逻辑 - 过滤DEBUG级别日志
+  if [log.level] == "DEBUG" {
+    drop { }
+  }
+
+  # 第三步：保留原有逻辑 - 时间格式转换
+  date{
+    timezone => "Asia/Shanghai"
+    match => ["log.date", "ISO8601"]
+    target => "@timestamp"
+  }
+
+  # 第四步：保留原有逻辑 - 移除无用字段
+  mutate {
+    remove_field => ["event","agent","ecs","tags","log.date","stream","container.runtime"]
+  }
+
+  # 新增：标记是否包含trace-id（用于后续分索引）
+  mutate {
+    # 如果trace-id字段存在且非空，添加标记字段
+    add_field => { "has_trace_id" => "true" }
+  }
+  # 处理不带trace-id的日志（清空标记）
+  if ![trace-id] {
+    mutate {
+      remove_field => ["has_trace_id"]
+    }
+  }
+}
+
+output {
+  # 核心修改：分两种情况输出（带trace-id / 不带trace-id）
+  # 情况1：带trace-id的日志 → 输出到xxx-traceid索引
+  if [has_trace_id] == "true" {
+    if [env] == "dev" {
+      pipeline { send_to => dev-traceid }
+    } else if [env] == "beta" {
+      pipeline { send_to => beta-traceid }
+    } else if [env] == "autotest" {
+      pipeline { send_to => autotest-traceid }
+    } else if [env] == "sit" {
+      pipeline { send_to => sit-traceid }
+    } else if [env] == "perf" {
+      pipeline { send_to => perf-traceid }
+    } else if [env] == "feature" {
+      pipeline { send_to => feature-traceid }
+    } else if [env] == "dfr" {
+      pipeline { send_to => dfr-traceid }
+    } else {
+      pipeline { send_to => others-traceid }
+    }
+  }
+  # 情况2：不带trace-id的日志 → 保留原有输出逻辑
+  else {
+    if [env] == "dev" {
+      pipeline { send_to => dev }
+    } else if [env] == "beta" {
+      pipeline { send_to => beta }
+    } else if [env] == "autotest" {
+      pipeline { send_to => autotest }
+    } else if [env] == "sit" {
+      pipeline { send_to => sit }
+    } else if [env] == "perf" {
+      pipeline { send_to => perf }
+    } else if [env] == "feature" {
+      pipeline { send_to => feature }
+    } else if [env] == "dfr" {
+      pipeline { send_to => dfr }
+    } else {
+      pipeline { send_to => others }
+    }
+  }
+}
+
+# 2. 原有环境的pipeline（保留不变）
+pipeline.id: dev-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => dev }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-dev-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: beta-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => beta }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-beta-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: autotest-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => autotest }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-autotest-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: sit-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => sit }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-sit-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: perf-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => perf }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-perf-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: feature-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => feature }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-feature-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: dfr-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => dfr }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-dfr-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: others-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => others }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-others-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+# 3. 新增带trace-id的环境pipeline（对应xxx-traceid索引）
+pipeline.id: dev-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => dev-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-dev-traceid-%{+YYYY.MM.dd}"  # 新增traceid后缀
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: beta-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => beta-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-beta-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: autotest-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => autotest-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-autotest-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: sit-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => sit-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-sit-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: perf-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => perf-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-perf-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: feature-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => feature-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-feature-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: dfr-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => dfr-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-dfr-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
+
+pipeline.id: others-traceid-processing
+queue.type: persisted
+config.string: |
+input { pipeline { address => others-traceid }}
+output { 
+elasticsearch {
+hosts=> ["https://192.168.182.27:9200", "https://192.168.182.56:9200", "https://192.168.182.231:9200"]
+index => "businesslog-others-traceid-%{+YYYY.MM.dd}"
+ssl_certificate_authorities => ['/data/app/logstash-8.17.3/config/elasticsearch-ca.pem']
+user => "elastic"
+password => "${es_pwd}"
+}
+}
