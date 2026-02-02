@@ -1,0 +1,94 @@
+# ========== 输入配置（根据实际日志来源调整） ==========
+input {
+  # 示例：文件输入（可替换为 beats/kafka/redis 等）
+  file {
+    path => ["/var/log/etp-trace/*.log"]  # 替换为你的日志文件路径
+    start_position => "beginning"         # 首次运行从头读取
+    sincedb_path => "/dev/null"           # 测试用（生产环境改为自定义路径，如 /var/log/logstash/sincedb）
+    codec => "json"                       # 直接解析JSON格式日志，无需额外过滤
+    tags => ["etp-trace"]                 # 打标签，方便筛选
+  }
+}
+
+# ========== 过滤配置（核心：时间转换） ==========
+filter {
+  # 1. 提取微秒级时间戳并转换为整数
+  mutate {
+    convert => {
+      "start_time" => "integer"
+      "end_time" => "integer"
+      "duration" => "integer"
+    }
+  }
+
+  # 2. 通用时间转换函数（东八区，微秒→ISO8601+易读格式）
+  ruby {
+    code => '
+      require "time"
+      TZ_OFFSET = 8 * 3600  # 东八区偏移（秒）
+
+      # 定义转换方法
+      def convert_us_to_cst(us_ts)
+        return nil unless us_ts
+        seconds = us_ts.to_f / 1000000  # 微秒转秒（保留小数）
+        utc_time = Time.at(seconds)
+        cst_time = utc_time + TZ_OFFSET  # 转为东八区
+        {
+          iso: cst_time.iso8601(6),      # ISO8601格式（带6位微秒，Kibana识别）
+          readable: cst_time.strftime("%Y-%m-%d %H:%M:%S.%6N")  # 易读格式
+        }
+      end
+
+      # 转换start_time
+      start_convert = convert_us_to_cst(event.get("start_time"))
+      if start_convert
+        event.set("start_time_iso", start_convert[:iso])
+        event.set("start_time_readable", start_convert[:readable])
+      end
+
+      # 转换end_time
+      end_convert = convert_us_to_cst(event.get("end_time"))
+      if end_convert
+        event.set("end_time_iso", end_convert[:iso])
+        event.set("end_time_readable", end_convert[:readable])
+      end
+
+      # 可选：duration转换为毫秒（方便Kibana可视化）
+      duration = event.get("duration")
+      event.set("duration_ms", duration.to_f / 1000) if duration
+    '
+  }
+
+  # 3. 将start_time_iso设为Logstash事件的@timestamp（Kibana默认时间字段）
+  mutate {
+    add_field => { "@timestamp" => "%{start_time_iso}" }
+  }
+
+  # 4. 可选：清理冗余字段（精简日志）
+  # mutate {
+  #   remove_field => ["message"]  # 若已解析JSON，message字段可删除
+  # }
+}
+
+# ========== 输出配置（适配ES 8.x） ==========
+output {
+  # 输出到Elasticsearch
+  elasticsearch {
+    hosts => ["http://your-es-host:9200"]  # 替换为你的ES地址（集群用逗号分隔）
+    index => "etp-trace-%{+YYYY.MM.dd}"    # 按日期分索引，方便管理
+    # 8.x版本安全配置（启用ES安全功能时必填）
+    user => "elastic"                      # 替换为你的ES用户名
+    password => "your-elastic-password"    # 替换为你的ES密码
+    # 若ES启用HTTPS，取消以下注释
+    # ssl => true
+    # cacert => "/etc/logstash/certs/ca.crt"  # CA证书路径
+    # ssl_verification_mode => "full"
+  }
+
+  # 控制台输出（测试用，生产环境可注释）
+  stdout {
+    codec => rubydebug {
+      metadata => false  # 不显示元数据，简化输出
+    }
+  }
+}
